@@ -1,0 +1,4 @@
+Generate executable:
+pyinstaller "convert-2-ascii-v5.py" --upx-dir "__upx_dir__" --noconsole --icon "convert-2-ascii-icon.ico" --onefile --add-data "convert-2-ascii-icon.ico;." --add-data "ffmpeg.exe;." --add-data "ffprobe.exe;." --clean --key "_key_" --name "Convert-2-ASCII-v5"
+
+- do this first: https://stackoverflow.com/a/71741286/9927277
