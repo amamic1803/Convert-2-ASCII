@@ -3,6 +3,8 @@ A program to convert images or videos to ASCII art
 
 ![screenshot](https://user-images.githubusercontent.com/40371578/179856803-2de013bc-5726-4ffb-9649-8c63e712952a.png)
 
+![demo](https://user-images.githubusercontent.com/40371578/204025607-b34e3229-30d3-4427-8d30-b14e9b5195f2.png)
+
 ## Downloading
 Prebuilt program is available under Releases
 
