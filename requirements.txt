@@ -1,11 +1,5 @@
-altgraph==0.17.3
-ffmpeg-python==0.2.0
-future==0.18.2
-numpy==1.23.5
-opencv-python==4.5.5.64
-pefile==2022.5.30
-Pillow==9.3.0
-pyinstaller==5.6.2
-pyinstaller-hooks-contrib==2022.13
-pywin32-ctypes==0.2.0
-tinyaes==1.0.4
+ffmpeg-python @ git+https://github.com/amamic1803/ffmpeg-python
+numpy==1.26.3
+opencv-python==4.9.0.80
+Pillow==10.2.0
+pyinstaller==6.3.0

@@ -1,14 +1,16 @@
+import collections
+import multiprocessing
 import os
+import random
+import statistics
 import sys
+import threading
 import time
-from math import ceil
-from multiprocessing import Pool, freeze_support
-from threading import Thread
-from tkinter import *
+import tkinter as tk
+from tkinter.colorchooser import askcolor
 from tkinter.filedialog import asksaveasfilename, askopenfilename
 from tkinter.messagebox import showerror
 
-import _tkinter
 import cv2
 import ffmpeg
 import numpy as np
@@ -16,552 +18,629 @@ from PIL import Image as PIL_Image
 from PIL import ImageTk as PIL_ImageTk
 
 
-def resource_path(relative_path=""):
-	""" Get absolute path to resource, works for dev and for PyInstaller """
-	try:
-		# PyInstaller creates a temp folder and stores path in _MEIPASS
-		base_path = sys._MEIPASS
-	except Exception:
-		base_path = os.path.abspath(".")
-	return os.path.join(base_path, relative_path)
+ASCII_SCALE = r"""$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\|()1{}[]?-_+~<>i!lI;:,"^`'. """
 
-def frame_to_ascii(frame, width, height, text_color, font_scale, ascii_scale):
-	frame_ascii = np.full((height, width, 3), abs(text_color - 255), dtype="uint8")
+def frame_to_ascii(frame, font_scale, front_color, back_color):
+	front_color = hex_to_rgb(front_color)
+	back_color = hex_to_rgb(back_color)
+
+	front_brightness = statistics.mean(front_color)
+	back_brightness = statistics.mean(back_color)
+
+	height, width, _ = frame.shape
+	pixel = np.array(back_color, dtype="uint8")
+	frame_ascii = np.full((height, width, 3), pixel, dtype="uint8")
+
+	if back_brightness > front_brightness:
+		def ascii_char(x_l, x_h, y_l, y_h) -> str:
+			return ASCII_SCALE[int(round(np.average(frame[y_l:y_h, x_l:x_h]) / 255 * (len(ASCII_SCALE) - 1), 0))]
+	else:
+		def ascii_char(x_l, x_h, y_l, y_h) -> str:
+			return ASCII_SCALE[len(ASCII_SCALE) - 1 - int(round(np.average(frame[y_l:y_h, x_l:x_h]) / 255 * (len(ASCII_SCALE) - 1), 0))]
 
 	box_size = cv2.getTextSize("$", cv2.FONT_HERSHEY_PLAIN, font_scale, 1)[0][0]
 	leftover_height = height % box_size
 	for i in range(0, width, box_size):
-		cv2.putText(img=frame_ascii, text=ascii_scale[abs(ceil(((int(round(np.average(frame[0: box_size, i:i + box_size]), 0)) + 1) * 35) / 128) - 1 - (69 * (text_color // 255)))], org=(i, leftover_height - 1), fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=font_scale, color=(text_color, text_color, text_color), thickness=1, lineType=cv2.LINE_AA)
+		if leftover_height != 0:
+			cv2.putText(
+				img=frame_ascii,
+				text=ascii_char(i, i + box_size, 0, leftover_height),
+				org=(i, leftover_height - 1),
+				fontFace=cv2.FONT_HERSHEY_PLAIN,
+				fontScale=font_scale,
+				color=front_color,
+				thickness=1,
+				lineType=cv2.LINE_AA
+			)
 		for j in range(leftover_height, height, box_size):
-			cv2.putText(img=frame_ascii, text=ascii_scale[abs(ceil(((int(round(np.average(frame[j:j + box_size, i:i + box_size]), 0)) + 1) * 35) / 128) - 1 - (69 * (text_color // 255)))], org=(i, j + box_size - 1), fontFace=cv2.FONT_HERSHEY_PLAIN, fontScale=font_scale, color=(text_color, text_color, text_color), thickness=1, lineType=cv2.LINE_AA)
+			cv2.putText(
+				img=frame_ascii,
+				text=ascii_char(i, i + box_size, j, j + box_size),
+				org=(i, j + box_size - 1),
+				fontFace=cv2.FONT_HERSHEY_PLAIN,
+				fontScale=font_scale,
+				color=front_color,
+				thickness=1,
+				lineType=cv2.LINE_AA
+			)
 
 	return frame_ascii
 
-def change_thickness(event, widget, typ):
-	global started
-	if not started:
-		if typ:
-			widget.config(highlightthickness=1)
+def hex_to_rgb(hex_color: str) -> tuple[int, int, int]:
+	hex_color = hex_color.lstrip("#")
+	return tuple(int(hex_color[i:i + 2], 16) for i in (0, 2, 4))
+
+class App:
+	def __init__(self):
+		self.ffmpeg_path = self.resource_path("resources/ffmpeg/bin/ffmpeg.exe")
+		self.ffprobe_path = self.resource_path("resources/ffmpeg/bin/ffprobe.exe")
+
+		self.front_color = "#000000"
+		self.back_color = "#ffffff"
+
+		self.job_id = 1
+		self.processing = False
+		self.processing_video = False
+
+		self.img_cvt_thread = None
+		self.vid_cvt_thread = None
+		self.preview_img_cvt_thread = None
+		self.preview_vid_cvt_thread = None
+
+		self.root = tk.Tk()
+		self.root.title("Convert-2-ASCII")
+		self.root.resizable(False, False)
+		self.root.iconbitmap(self.resource_path("resources/convert-icon.ico"))
+		self.root.config(background="#202A44")
+		self.root.geometry(f"500x250+{self.root.winfo_screenwidth() // 2 - 250}+{self.root.winfo_screenheight() // 2 - 125}")
+		self.root.protocol("WM_DELETE_WINDOW", self.close_app)
+
+		self.title = tk.Label(self.root, text="Convert-2-ASCII", font=("Helvetica", 30, "bold", "italic"),
+		                      borderwidth=0, background="#202A44", activebackground="#202A44",
+		                      foreground="#ffffff", activeforeground="#ffffff")
+		self.title.place(x=0, y=0, width=500, height=100)
+
+		self.status_line_lbl = tk.Label(self.root, text="Ready", font=("Helvetica", 9, "bold"), borderwidth=0,
+		                                background="#202A44", activebackground="#202A44",
+		                                foreground="#ffffff", activeforeground="#ffffff")
+		self.status_line_lbl.place(x=130, y=203, width=240, height=30)
+
+		self.file_lbl = tk.Label(self.root, text="File:", font=("Helvetica", 12, "bold"), borderwidth=0,
+		                         background="#202A44", activebackground="#202A44",
+		                         foreground="#ffffff", activeforeground="#ffffff")
+		self.file_lbl.place(x=0, y=150, width=50, height=30)
+
+		self.reg_ready = self.root.register(lambda: self.status_line_lbl.config(text="Ready") or True)  # change status line to "Ready" when entry is edited
+		self.file_ent = tk.Entry(self.root, font=("Helvetica", 10), validate="key", validatecommand=self.reg_ready,
+		                         borderwidth=0, highlightthickness=1, highlightbackground="green", highlightcolor="green",
+		                         disabledbackground="grey15", disabledforeground="#ffffff", background="grey15",
+		                         foreground="#ffffff", justify=tk.LEFT, insertbackground="#ffffff")
+		self.file_ent.place(x=46, y=150, width=385, height=30)
+
+		self.browse_btn = tk.Label(self.root, text="Browse", font=("Helvetica", 10), cursor="hand2",
+		                           highlightthickness=1, borderwidth=0, highlightbackground="green", highlightcolor="green",
+		                           background="grey15", activebackground="grey15",
+		                           foreground="#ffffff", activeforeground="#ffffff")
+		self.browse_btn.place(x=430, y=150, width=65, height=30)
+		self.browse_btn.bind("<Enter>", lambda event: self.browse_btn.config(highlightthickness=3) if not self.processing else None)
+		self.browse_btn.bind("<Leave>", lambda event: self.browse_btn.config(highlightthickness=1) if not self.processing else None)
+		self.browse_btn.bind("<ButtonRelease-1>", lambda event: self.browse_click())
+
+		self.colors_lbl = tk.Label(self.root, text="Colors:", font=("Helvetica", 12, "bold"), borderwidth=0,
+		                           background="#202A44", activebackground="#202A44",
+		                           foreground="#ffffff", activeforeground="#ffffff")
+		self.colors_lbl.place(x=290, y=105, width=100, height=30)
+
+		self.color_front_lbl = tk.Label(self.root, cursor="hand2", borderwidth=0, background=self.front_color, activebackground=self.front_color,
+		                                highlightthickness=2, highlightbackground="green", highlightcolor="green")
+		self.color_front_lbl.place(x=375, y=105, width=30, height=30)
+		self.color_front_lbl.bind("<ButtonRelease-1>", lambda event: self.choose_color("front"))
+
+		self.color_back_lbl = tk.Label(self.root, cursor="hand2", borderwidth=0, background=self.back_color, activebackground=self.back_color,
+		                               highlightthickness=2, highlightbackground="green", highlightcolor="green")
+		self.color_back_lbl.place(x=410, y=105, width=30, height=30)
+		self.color_back_lbl.bind("<ButtonRelease-1>", lambda event: self.choose_color("back"))
+
+		self.fontscale_lbl = tk.Label(self.root, text="Font scale:", font=("Helvetica", 12, "bold"), borderwidth=0,
+		                              background="#202A44", activebackground="#202A44",
+		                              foreground="#ffffff", activeforeground="#ffffff")
+		self.fontscale_lbl.place(x=50, y=105, width=85, height=30)
+		self.fontscale_ent_reg = self.root.register(self.validate_fontscale)
+		self.fontscale_ent = tk.Entry(self.root, font=("Helvetica", 10), justify=tk.CENTER, borderwidth=0,
+		                              validate="key", validatecommand=(self.fontscale_ent_reg, "%P"),
+		                              highlightthickness=1, highlightbackground="green", highlightcolor="green",
+		                              disabledbackground="grey15", disabledforeground="#ffffff",
+		                              background="grey15", foreground="#ffffff", insertbackground="#ffffff")
+		self.fontscale_ent.place(x=140, y=105, width=50, height=30)
+		self.fontscale_ent.insert(0, "0.5")
+
+		self.convert_btn = tk.Label(self.root, text="Convert", font=("Helvetica", 10), borderwidth=0, cursor="hand2",
+		                            highlightthickness=1, highlightbackground="green", highlightcolor="green",
+		                            background="grey15", activebackground="grey15",
+		                            foreground="#ffffff", activeforeground="#ffffff")
+		self.convert_btn.place(x=370, y=203, width=100, height=30)
+		self.convert_btn.bind("<Enter>", lambda event: self.convert_btn.config(highlightthickness=3) if not self.processing or self.processing_video else None)
+		self.convert_btn.bind("<Leave>", lambda event: self.convert_btn.config(highlightthickness=1) if not self.processing or self.processing_video else None)
+		self.convert_btn.bind("<ButtonRelease-1>", lambda event: self.convert_click())
+
+		self.preview_btn = tk.Label(self.root, text="Preview", font=("Helvetica", 10), borderwidth=0, cursor="hand2",
+		                            highlightthickness=1, highlightbackground="green", highlightcolor="green",
+		                            background="grey15", activebackground="grey15",
+		                            foreground="#ffffff", activeforeground="#ffffff")
+		self.preview_btn.place(x=30, y=203, width=100, height=30)
+		self.preview_btn.bind("<Enter>", lambda event: self.preview_btn.config(highlightthickness=3) if not self.processing else None)
+		self.preview_btn.bind("<Leave>", lambda event: self.preview_btn.config(highlightthickness=1) if not self.processing else None)
+		self.preview_btn.bind("<ButtonRelease-1>", lambda event: self.preview_click())
+
+		self.root.mainloop()
+
+	def close_app(self):
+		if self.processing_video:
+			showerror(title="Processing Video", message="Please stop the video conversion before closing the app!", parent=self.root)
 		else:
-			widget.config(highlightthickness=3)
+			self.root.destroy()
 
-def convert_change_thickness(event, typ):
-	global image_converting
-	if not image_converting and not preview_converting:
-		if typ:
-			convert_btn.config(highlightthickness=1)
+	def choose_color(self, place: str):
+		if not self.processing:
+			match place:
+				case "front":
+					new_color = askcolor(initialcolor=self.front_color, parent=self.root, title="Choose foreground color")
+					if new_color[1] is not None:
+						self.front_color = new_color[1]
+						self.color_front_lbl.config(background=self.front_color, activebackground=self.front_color)
+						self.status_line_lbl.config(text="Ready")
+				case "back":
+					new_color = askcolor(initialcolor=self.back_color, parent=self.root, title="Choose background color")
+					if new_color[1] is not None:
+						self.back_color = new_color[1]
+						self.color_back_lbl.config(background=self.back_color, activebackground=self.back_color)
+						self.status_line_lbl.config(text="Ready")
+				case _:
+					raise ValueError("place must be either 'front' or 'back'")
+
+	def get_save_path(self, og_path, video=False):
+		init_name, init_extension = os.path.splitext(os.path.basename(og_path))
+
+		if not video:
+			init_extension = ".png"  # always use PNG for images
+
+		init_dir = os.path.dirname(og_path)
+		if not video:
+			init_filetypes = (("Image file", f"*{init_extension}"),)
 		else:
-			convert_btn.config(highlightthickness=3)
+			init_filetypes = (("Video file", f"*{init_extension}"),)
 
-def browse_click(event):
-	global started
-	if not started:
-		init_dir = os.path.dirname(file_ent.get())
-		if not os.path.isdir(init_dir):
-			init_dir = os.getcwd()
+		return asksaveasfilename(
+			confirmoverwrite=True,
+			defaultextension=init_extension,
+			filetypes=init_filetypes,
+			initialdir=init_dir,
+			parent=self.root,
+			initialfile=f"""{init_name}-ASCII-{str(time.time()).replace(".", "")}""")
 
-		selection = askopenfilename(filetypes=(("All files", ""), ("Video files", "*.mp4;*.avi;*.mpg;*.mov;*.wmv;*.mkv"), ("JPEG files", "*.jpeg;*.jpg"), ("Portable Network Graphics", "*.png"), ("Windows bitmaps", "*.bmp;*.dib"), ("WebP", "*.webp"), ("Sun rasters", "*.sr;*.ras"), ("TIFF files", "*.tiff;*.tif")), initialdir=init_dir, parent=root)
-		if selection != "":
-			file_ent.delete(0, END)
-			file_ent.insert(0, selection.replace("/", "\\"))
-			file_ent.xview_moveto(1)
+	def browse_click(self):
+		if not self.processing:
+			init_dir = os.path.dirname(self.file_ent.get())
+			if not os.path.isdir(init_dir):
+				init_dir = os.path.dirname(sys.executable)
+			if not os.path.isdir(init_dir):
+				init_dir = os.path.join(os.path.expanduser('~'), 'Desktop')
 
-def convert_click(event, open_path):
-	global selected_text_color, ffprobe_path, started, video_converting, image_converting, video_convert_thread, image_convert_thread, started_no
-	if not started:
-		started = True
-		toggle_ui()
-		convert_btn.config(text="Convert", highlightcolor="black", highlightbackground="black", highlightthickness=1)
-		preview_btn.config(highlightthickness=1)
-		root.update_idletasks()
-		if os.path.isfile(open_path):
-			og_img = cv2.imread(open_path, cv2.IMREAD_COLOR)
-			if og_img is not None:
-				save_path = get_save_path(open_path, "img")
-				if save_path != "":
-					image_converting = True
-					start_time = time.time()
-					status_line_lbl.config(text="Converting...")
-					image_convert_thread = Thread(target=image_converter, args=(og_img, save_path, start_time))
-					image_convert_thread.start()
-				else:
-					started = False
-					toggle_ui()
-			else:
+			selection = askopenfilename(filetypes=(
+				("All files", ""),
+				("Video files", "*.mp4;*.avi;*.mpg;*.mov;*.wmv;*.mkv"),
+				("JPEG files", "*.jpeg;*.jpg"),
+				("Portable Network Graphics", "*.png"),
+				("Windows bitmaps", "*.bmp;*.dib"),
+				("WebP", "*.webp"),
+				("Sun rasters", "*.sr;*.ras"),
+				("TIFF files", "*.tiff;*.tif")
+			), initialdir=init_dir, parent=self.root)
+			if selection != "":
+				self.file_ent.delete(0, tk.END)
+				self.file_ent.insert(0, selection.replace("/", "\\"))
+				self.file_ent.xview_moveto(1)
 
-				longest_video_stream = None
-				length_of_longest = 0
+	def convert_click(self):
+		if not self.processing:
+			self.processing = True
+			self.update_ui()
+			self.root.update_idletasks()
 
-				try:
-					probe_info = ffmpeg.probe(open_path, cmd=ffprobe_path)
-					for i in range(len(probe_info["streams"])):
-						try:
-							if probe_info["streams"][i]["codec_type"] == "video" and float(probe_info["streams"][i]["bit_rate"]) > 0 and probe_info["streams"][i]["width"] * probe_info["streams"][i]["height"] != 0 and float(probe_info["streams"][i]["duration"]) >= 0.25 and float(probe_info["streams"][i]["duration"]) >= length_of_longest:
-								longest_video_stream = i
-								length_of_longest = float(probe_info["streams"][i]["duration"])
-						except KeyError:
-							pass
-				except ffmpeg._run.Error:
-					pass
+			open_path = self.file_ent.get()
 
-				if longest_video_stream is not None:
-					save_path = get_save_path(open_path, "video")
+			if os.path.isfile(open_path):
+				self.status_line_lbl.config(text="Converting...")
+				self.root.update_idletasks()
+				og_img = cv2.imread(open_path, cv2.IMREAD_COLOR)  # try to read as image
+
+				if og_img is not None:
+					# successfully read as image
+					save_path = self.get_save_path(open_path, video=False)
 					if save_path != "":
-						convert_btn.config(text="Stop", highlightcolor="red", highlightbackground="red", highlightthickness=1)
-						video_converting = True
 						start_time = time.time()
-						status_line_lbl.config(text="Converting...")
-						root.update_idletasks()
-						v_stream_indx = str(longest_video_stream)
-						width = probe_info["streams"][longest_video_stream]["width"]
-						height = probe_info["streams"][longest_video_stream]["height"]
-						fps = eval(probe_info["streams"][longest_video_stream]["avg_frame_rate"])
-						pixel_format = probe_info["streams"][longest_video_stream]["pix_fmt"]
-						og_codec = probe_info["streams"][longest_video_stream]["codec_name"]
-						num_of_frames = int(probe_info["streams"][longest_video_stream]["nb_frames"])
-
-						try:
-							fontScale = float(fontscale_ent.get())
-						except ValueError:
-							fontScale = 0.001
-						if fontScale == 0:
-							fontScale = 0.001
-
-						video_convert_thread = Thread(target=video_converter, args=(fontScale, selected_text_color, open_path, save_path, v_stream_indx, width, height, fps, pixel_format, og_codec, num_of_frames, start_time, started_no))
-						video_convert_thread.start()
+						self.img_cvt_thread = threading.Thread(target=self.img_cvt, args=(og_img, save_path, start_time), daemon=True)
+						self.img_cvt_thread.start()
 					else:
-						started = False
-						toggle_ui()
+						self.processing = False
+						self.update_ui()
+						self.status_line_lbl.config(text="Ready")
+						self.root.update_idletasks()
 				else:
-					showerror(title="File Format Error!", message="The specified file's format is not supported!")
-					started = False
-					toggle_ui()
-		else:
-			showerror(title="File Not Found!", message="The specified file was not found!")
-			started = False
-			toggle_ui()
-	elif video_converting:
-		started = False
-		video_converting = False
-		started_no += 1
-		toggle_ui()
-		status_line_lbl.config(text="Stopped")
+					longest_video_stream = None
+					length_of_longest = 0
+					try:
+						probe_info = ffmpeg.probe(open_path, cmd=self.ffprobe_path)
+						for i in range(len(probe_info["streams"])):
+							try:
+								if (probe_info["streams"][i]["codec_type"] == "video"
+									and float(probe_info["streams"][i]["bit_rate"]) > 0
+									and probe_info["streams"][i]["width"] * probe_info["streams"][i]["height"] != 0
+									and float(probe_info["streams"][i]["duration"]) >= 0.25
+									and float(probe_info["streams"][i]["duration"]) >= length_of_longest):
 
-def preview_click(event, open_path):
-	global started, preview_converting, preview_convert_thread, preview_video_convert_thread, ffprobe_path
-	if not started:
-		started = True
-		toggle_ui()
-		convert_btn.config(text="Convert", highlightcolor="black", highlightbackground="black", highlightthickness=1)
-		preview_btn.config(highlightthickness=1)
-		root.update_idletasks()
+									longest_video_stream = i
+									length_of_longest = float(probe_info["streams"][i]["duration"])
+							except KeyError:
+								pass
+					except Exception:
+						pass
+					del length_of_longest
 
-		if os.path.isfile(open_path):
-			og_img = cv2.imread(open_path, cv2.IMREAD_COLOR)
-			if og_img is not None:
-				preview_converting = True
-				status_line_lbl.config(text="Generating...")
-				preview_convert_thread = Thread(target=preview_converter, args=(og_img, ))
-				preview_convert_thread.start()
+					if longest_video_stream is not None:
+						save_path = self.get_save_path(open_path, video=True)
+						if save_path != "":
+							self.processing_video = True
+							self.update_ui()
+							self.root.update_idletasks()
+							start_time = time.time()
+							self.vid_cvt_thread = threading.Thread(target=self.vid_cvt, args=(open_path, longest_video_stream, save_path, start_time), daemon=True)
+							self.vid_cvt_thread.start()
+						else:
+							self.processing = False
+							self.update_ui()
+							self.status_line_lbl.config(text="Ready")
+							self.root.update_idletasks()
+					else:
+						showerror(title="File Format Error!", message="The specified file's format is not supported!", parent=self.root)
+						self.processing = False
+						self.update_ui()
+						self.status_line_lbl.config(text="Error")
+						self.root.update_idletasks()
 			else:
+				showerror(title="File Not Found!", message="The specified file was not found!", parent=self.root)
+				self.processing = False
+				self.update_ui()
+				self.status_line_lbl.config(text="Error")
+				self.root.update_idletasks()
+		elif self.processing_video:  # stop clicked
+			self.processing = False
+			self.processing_video = False
+			self.job_id += 1
+			self.update_ui()
+			self.root.update_idletasks()
 
-				longest_video_stream = None
-				length_of_longest = 0
+	def preview_click(self):
+		try:
+			if not self.processing:
+				self.processing = True
+				self.update_ui()
+				self.root.update_idletasks()
 
-				try:
-					probe_info = ffmpeg.probe(open_path, cmd=ffprobe_path)
-					for i in range(len(probe_info["streams"])):
+				open_path = self.file_ent.get()
+				if os.path.isfile(open_path):
+					self.status_line_lbl.config(text="Generating...")
+					self.root.update_idletasks()
+					og_img = cv2.imread(open_path, cv2.IMREAD_COLOR)  # try to read as image
+					if og_img is not None:  # if it's an image
+						self.preview_img_cvt_thread = threading.Thread(target=self.preview_img_cvt, args=(og_img,), daemon=True)
+						self.preview_img_cvt_thread.start()
+					else:  # if it's not an image
+						longest_video_stream = None
+						length_of_longest = 0
 						try:
-							if probe_info["streams"][i]["codec_type"] == "video" and float(probe_info["streams"][i]["bit_rate"]) > 0 and probe_info["streams"][i]["width"] * probe_info["streams"][i]["height"] != 0 and float(probe_info["streams"][i]["duration"]) >= 0.25 and float(probe_info["streams"][i]["duration"]) >= length_of_longest:
-								longest_video_stream = i
-								length_of_longest = float(probe_info["streams"][i]["duration"])
-						except KeyError:
+							probe_info = ffmpeg.probe(open_path, cmd=self.ffprobe_path)
+							for i in range(len(probe_info["streams"])):
+								try:
+									if (probe_info["streams"][i]["codec_type"] == "video"
+										and float(probe_info["streams"][i]["bit_rate"]) > 0
+										and probe_info["streams"][i]["width"] * probe_info["streams"][i]["height"] != 0
+										and float(probe_info["streams"][i]["duration"]) >= 0.25
+										and float(probe_info["streams"][i]["duration"]) >= length_of_longest):
+
+										longest_video_stream = i
+										length_of_longest = float(probe_info["streams"][i]["duration"])
+								except KeyError:
+									pass
+						except Exception:
 							pass
-				except ffmpeg._run.Error:
+
+						# if there is a video stream in the file
+						if longest_video_stream is not None:
+							self.preview_vid_cvt_thread = threading.Thread(target=self.preview_vid_cvt, args=(open_path, longest_video_stream, length_of_longest), daemon=True)
+							self.preview_vid_cvt_thread.start()
+						else:
+							showerror(title="File Format Error!", message="The specified file's format is not supported!")
+							self.processing = False
+							self.update_ui()
+							self.status_line_lbl.config(text="Error")
+				else:
+					showerror(title="File Not Found!", message="The specified file was not found!")
+					self.processing = False
+					self.update_ui()
+					self.status_line_lbl.config(text="Error")
+		except Exception:  # app was closed while processing
+			pass
+
+	def update_ui(self):
+		if self.processing:
+			self.file_ent.config(state=tk.DISABLED, highlightcolor="black", highlightbackground="black")
+			self.browse_btn.config(highlightcolor="black", highlightbackground="black", cursor="arrow")
+			self.color_front_lbl.config(cursor="arrow")
+			self.color_back_lbl.config(cursor="arrow")
+			self.fontscale_ent.config(state=tk.DISABLED, highlightcolor="black", highlightbackground="black")
+			self.preview_btn.config(highlightcolor="black", highlightbackground="black", highlightthickness=1, cursor="arrow")
+			if self.processing_video:
+				self.convert_btn.config(text="Stop", highlightcolor="red", highlightbackground="red", cursor="hand2")
+			else:
+				self.convert_btn.config(text="Convert", highlightcolor="black", highlightbackground="black", cursor="arrow", highlightthickness=1)
+		else:
+			self.file_ent.config(state=tk.NORMAL, highlightcolor="green", highlightbackground="green")
+			self.browse_btn.config(highlightcolor="green", highlightbackground="green", cursor="hand2")
+			self.color_front_lbl.config(cursor="hand2")
+			self.color_back_lbl.config(cursor="hand2")
+			self.fontscale_ent.config(state=tk.NORMAL, highlightcolor="green", highlightbackground="green")
+			self.preview_btn.config(highlightcolor="green", highlightbackground="green", cursor="hand2")
+			self.convert_btn.config(text="Convert", highlightcolor="green", highlightbackground="green", cursor="hand2")
+
+	def img_cvt(self, og_img, save_path, start_time):
+		try:
+			try:
+				font_scale_val = float(self.fontscale_ent.get())
+			except ValueError:
+				font_scale_val = 0.001
+			if font_scale_val == 0:
+				font_scale_val = 0.001
+
+			converted_img = cv2.cvtColor(frame_to_ascii(og_img, font_scale_val, self.front_color, self.back_color), cv2.COLOR_RGB2BGR)
+
+			cv2.imwrite(save_path, converted_img, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+
+			if not self.processing:  # if the app was closed while processing
+				try:
+					os.remove(save_path)
+				except OSError:
 					pass
 
-				if longest_video_stream is not None:
-					preview_converting = True
-					status_line_lbl.config(text="Generating...")
-					v_stream_indx = str(longest_video_stream)
-					width = probe_info["streams"][longest_video_stream]["width"]
-					height = probe_info["streams"][longest_video_stream]["height"]
+			self.processing = False
+			self.status_line_lbl.config(text=f"Completed ({round(time.time() - start_time, 3)} s)")
+			self.update_ui()
+		except Exception:  # app was closed while processing
+			pass
 
-					try:
-						fontScale = float(fontscale_ent.get())
-					except ValueError:
-						fontScale = 0.001
-					if fontScale == 0:
-						fontScale = 0.001
-
-					preview_video_convert_thread = Thread(target=preview_video_converter, args=(fontScale, selected_text_color, open_path, v_stream_indx, width, height))
-					preview_video_convert_thread.start()
-				else:
-					showerror(title="File Format Error!", message="The specified file's format is not supported!")
-					started = False
-					toggle_ui()
-		else:
-			showerror(title="File Not Found!", message="The specified file was not found!")
-			started = False
-			toggle_ui()
-
-def get_save_path(og_path, data_type):
-	init_name, init_extension = os.path.splitext(os.path.basename(og_path))
-	init_dir = os.path.dirname(og_path)
-	if data_type == "img":
-		init_filetypes = (("Image file", f"*{init_extension}"), )
-	else:
-		init_filetypes = (("Video file", f"*{init_extension}"), )
-	return asksaveasfilename(confirmoverwrite=True, defaultextension=init_extension, filetypes=init_filetypes, initialdir=init_dir, parent=root, initialfile=f"""{init_name}-ASCII-{str(time.time()).replace(".", "")}""")  # {time.strftime("%Y-%m-%d--%H-%M-%S")}
-
-def change_color_select_thickness(event, widget, color, typ):
-	global selected_text_color, started
-	if color == selected_text_color and not started:
-		if typ:
-			widget.config(highlightcolor="red", highlightbackground="red")
-		else:
-			widget.config(highlightcolor="green", highlightbackground="green")
-
-def color_select_click(event, color):
-	global selected_text_color, started
-	if color == selected_text_color and not started:
-		if color == 0:
-			background_white.config(highlightthickness=7, highlightcolor="red", highlightbackground="red")
-			background_black.config(highlightthickness=4, highlightcolor="green", highlightbackground="green")
-		else:
-			background_white.config(highlightthickness=4, highlightcolor="green", highlightbackground="green")
-			background_black.config(highlightthickness=7, highlightcolor="red", highlightbackground="red")
-		selected_text_color = abs(selected_text_color - 255)
-
-def validate_input(full_text):
-	if " " in full_text or "-" in full_text or full_text.count(".") > 1 or len(full_text) > 5:
-		return False
-	elif full_text == "" or full_text == ".":
-		return True
-	else:
+	def vid_cvt(self, video_path, stream_idx, save_path, start_time):
 		try:
-			float(full_text)
-			return True
-		except ValueError:
-			return False
+			curr_job_id = self.job_id
 
-def change_to_ready(full_text):
-	status_line_lbl.config(text="Ready")
-	return True
+			try:
+				probe_info = ffmpeg.probe(video_path, cmd=self.ffprobe_path)
+				try:
+					width = probe_info["streams"][stream_idx]["width"]
+					height = probe_info["streams"][stream_idx]["height"]
+					fps = eval(probe_info["streams"][stream_idx]["avg_frame_rate"])
+					pixel_format = probe_info["streams"][stream_idx]["pix_fmt"]
+					og_codec = probe_info["streams"][stream_idx]["codec_name"]
+					num_of_frames = int(probe_info["streams"][stream_idx]["nb_frames"])
+				except KeyError:
+					raise Exception
+			except Exception:
+				showerror(title="File Format Error!", message="The specified file's format is not supported!", parent=self.root)
+				self.processing = False
+				self.processing_video = False
+				self.update_ui()
+				return
 
-def video_converter(font_scale, color, open_path, save_path, v_stream_indx, width, height, fps, pixel_format, og_codec, num_of_frames, start_time, start_time_no):
-	global ffmpeg_path, ascii_scale, started, video_converting, started_no
+			try:
+				font_scale_val = float(self.fontscale_ent.get())
+			except ValueError:
+				font_scale_val = 0.001
+			if font_scale_val == 0:
+				font_scale_val = 0.001
 
-	process_in = (ffmpeg
-	              .input(open_path, r=fps)[v_stream_indx]
-	              .output('pipe:', format='rawvideo', pix_fmt='rgb24', r=fps)
-	              .global_args("-loglevel", "quiet")
-	              .run_async(pipe_stdout=True, cmd=ffmpeg_path)
-	              )
-	process_out = (ffmpeg
-	               .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}', r=fps)
-	               .output(ffmpeg.input(open_path, r=fps, vn=None), save_path, pix_fmt=pixel_format, r=fps, vcodec=og_codec, codec="copy")
-	               .global_args("-loglevel", "quiet")
-	               .overwrite_output()
-	               .run_async(pipe_stdin=True, cmd=ffmpeg_path)
-	               )
-	num_of_cpus = os.cpu_count()
-	status_line_lbl.config(text=f"Converting... 0.0 %")
-	broken = False
-	with Pool(processes=num_of_cpus) as pool:
-		queue_list = []
-		ended = False
-		count_frames = 0
-		while True:
-			if start_time_no != started_no:
-				broken = True
-				break
-			elif len(queue_list) < 2 * num_of_cpus and not ended:
-				in_bytes = process_in.stdout.read(width * height * 3)
-				if not in_bytes:
-					break
-				else:
-					in_frame = np.frombuffer(in_bytes, np.uint8).reshape([height, width, 3])
-					queue_list.append(pool.apply_async(frame_to_ascii, args=(in_frame, width, height, color, font_scale, ascii_scale)))
-					count_frames += 1
-					if count_frames < num_of_frames and start_time_no == started_no:
-						status_line_lbl.config(text=f"Converting... {round((count_frames / num_of_frames) * 100, 1)} %")
-			elif ended and len(queue_list) == 0:
-				break
+			process_in = (ffmpeg
+			              .input(video_path, r=fps)[str(stream_idx)]
+			              .output('pipe:', format='rawvideo', pix_fmt='rgb24', r=fps)
+			              .global_args("-loglevel", "quiet")
+			              .run_async(pipe_stdout=True, cmd=self.ffmpeg_path)
+			              )
+			process_out = (ffmpeg
+			               .input('pipe:', format='rawvideo', pix_fmt='rgb24', s=f'{width}x{height}', r=fps)
+			               .output(ffmpeg.input(video_path, r=fps, vn=None), save_path, pix_fmt=pixel_format, r=fps,
+			                       vcodec=og_codec, codec="copy")
+			               .global_args("-loglevel", "quiet")
+			               .overwrite_output()
+			               .run_async(pipe_stdin=True, cmd=self.ffmpeg_path)
+			               )
+
+			num_of_cpus = os.cpu_count()
+			self.status_line_lbl.config(text="Converting... 0.0 %")
+			self.root.update_idletasks()
+
+			broken = False
+			with multiprocessing.Pool(processes=num_of_cpus) as pool:
+				queue = collections.deque()
+				ended = False
+				count_frames = 0
+				while True:
+					if self.job_id != curr_job_id:
+						broken = True
+						break
+					elif len(queue) < 2 * num_of_cpus and not ended:
+						try:
+							in_bytes = process_in.stdout.read(width * height * 3)
+						except OSError:
+							in_bytes = b""
+
+						if not in_bytes:
+							ended = True
+						else:
+							in_frame = np.frombuffer(in_bytes, np.uint8).reshape([height, width, 3])
+							queue.append(pool.apply_async(frame_to_ascii, args=(in_frame, font_scale_val, self.front_color, self.back_color)))
+					elif len(queue) == 0 and ended:
+						break
+					else:
+						out_frame = queue.popleft().get()
+						process_out.stdin.write(out_frame.astype(np.uint8).tobytes())
+						count_frames += 1
+						self.status_line_lbl.config(text=f"Converting... {round((count_frames / num_of_frames) * 100, 1)} %")
+						self.root.update_idletasks()
+
+			process_out.stdin.close()
+			process_in.stdout.close()
+			process_out.wait()
+			process_in.wait()
+			if broken:  # if the app was closed while processing
+				try:
+					os.remove(save_path)
+				except OSError:
+					pass
+
+				self.status_line_lbl.config(text="Stopped")
+				self.root.update_idletasks()
 			else:
-				out_frame = queue_list[0].get()
-				process_out.stdin.write(out_frame.astype(np.uint8).tobytes())
-				queue_list.pop(0)
-				if count_frames == num_of_frames and start_time_no == started_no:
-					lower_percentage = ((count_frames - 1) / num_of_frames) * 100
-					status_line_lbl.config(text=f"Converting... {round(lower_percentage + ((100 - lower_percentage) * abs(len(queue_list) - (num_of_cpus * 2))), 1)} %")
-
-	process_out.stdin.close()
-	process_in.stdout.close()
-	process_out.wait()
-	process_in.wait()
-	if broken:
-		try:
-			os.remove(save_path)
-		except OSError:
+				self.processing = False
+				self.processing_video = False
+				self.status_line_lbl.config(text=f"Completed ({round(time.time() - start_time, 3)} s)")
+				self.update_ui()
+		except Exception:  # app was closed while processing
 			pass
-	else:
-		started = False
-		video_converting = False
-		toggle_ui()
-		status_line_lbl.config(text=f"Completed ({round(time.time() - start_time, 3)} s)")
 
-def image_converter(og_img, save_path, start_time):
-	global started, image_converting, selected_text_color, ascii_scale
-	height, width, depth = og_img.shape
-	try:
-		fontScale = float(fontscale_ent.get())
-	except ValueError:
-		fontScale = 0.001
-	if fontScale == 0:
-		fontScale = 0.001
-	converted_img = cv2.cvtColor(frame_to_ascii(og_img, width, height, selected_text_color, fontScale, ascii_scale), cv2.COLOR_BGR2GRAY)
-	cv2.imwrite(save_path, converted_img)
-	if not started:
+	def preview_img_cvt(self, og_img):
 		try:
-			os.remove(save_path)
-		except OSError:
+			try:
+				try:
+					font_scale_val = float(self.fontscale_ent.get())
+				except ValueError:
+					font_scale_val = 0.001
+				if font_scale_val == 0:
+					font_scale_val = 0.001
+
+				preview_img = frame_to_ascii(og_img, font_scale_val, self.front_color, self.back_color)
+				height, width, _ = preview_img.shape
+
+				width_fx = (self.root.winfo_screenwidth() * 0.8) / width
+				height_fx = (self.root.winfo_screenheight() * 0.8) / height
+				shrink_f = min(width_fx, height_fx)
+				if shrink_f < 1:
+					preview_img = cv2.resize(preview_img, (0, 0), fx=shrink_f, fy=shrink_f, interpolation=cv2.INTER_AREA)
+				height, width, _ = preview_img.shape
+
+				self.status_line_lbl.config(text="Preview")
+				self.root.update_idletasks()
+
+				preview_window = tk.Toplevel(self.root)
+				preview_window.title("Preview")
+				preview_window.geometry(f"{width}x{height}"
+				                        f"+{(self.root.winfo_screenwidth() // 2) - (width // 2)}"
+				                        f"+{(self.root.winfo_screenheight() // 2) - (height // 2)}")
+				preview_image_object = PIL_Image.fromarray(preview_img)
+				preview_image_object = PIL_ImageTk.PhotoImage(image=preview_image_object)
+				preview_widget = tk.Label(preview_window, image=preview_image_object)
+				preview_widget.place(x=0, y=0, width=width, height=height)
+				preview_window.iconbitmap(self.resource_path("resources/convert-icon.ico"))
+				preview_window.grab_set()
+				preview_window.resizable(False, False)
+				preview_window.focus_force()
+				preview_window.wait_window()
+
+				self.status_line_lbl.config(text="Ready")
+			except Exception:
+				self.status_line_lbl.config(text="Error")
+			finally:
+				self.processing = False
+				self.update_ui()
+		except Exception:  # app was closed while processing
 			pass
-	started = False
-	image_converting = False
-	try:
-		status_line_lbl.config(text=f"Completed ({round(time.time() - start_time, 3)} s)")
-		toggle_ui()
-	except RuntimeError:
-		pass
 
-def preview_converter(og_img):
-	global started, preview_converting, selected_text_color, ascii_scale
-	try:
-		height, width, depth = og_img.shape
+	def preview_vid_cvt(self, video_path, stream_idx, duration):
 		try:
-			fontScale = float(fontscale_ent.get())
-		except ValueError:
-			fontScale = 0.001
-		if fontScale == 0:
-			fontScale = 0.001
-		preview_img = frame_to_ascii(og_img, width, height, selected_text_color, fontScale, ascii_scale)
-		width_fx = (root.winfo_screenwidth() * 0.8) / width
-		height_fx = (root.winfo_screenheight() * 0.8) / height
-		shrink_f = min(width_fx, height_fx)
-		if shrink_f < 1:
-			preview_img = cv2.resize(preview_img, (0, 0), fx=shrink_f, fy=shrink_f, interpolation=cv2.INTER_AREA)
-		preview_img = cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB)
+			try:
+				try:
+					font_scale_val = float(self.fontscale_ent.get())
+				except ValueError:
+					font_scale_val = 0.001
+				if font_scale_val == 0:
+					font_scale_val = 0.001
 
-		height, width, depth = preview_img.shape
+				out_img, err = (ffmpeg
+				                .input(video_path, ss=(random.random() * 0.6 + 0.2) * duration)[str(stream_idx)]  # random time between 20% and 80% of the video
+				                .output('pipe:', vframes=1, format='image2pipe', vcodec="png")
+				                .run(capture_stdout=True, capture_stderr=True, cmd=self.ffmpeg_path)
+				                )
 
-		started = False
-		preview_converting = False
+				preview_og_image = cv2.imdecode(np.asarray(bytearray(out_img), dtype="uint8"), cv2.IMREAD_COLOR)
+				height, width, _ = preview_og_image.shape
 
-		status_line_lbl.config(text=f"Preview")
-		root.update_idletasks()
+				preview_img = frame_to_ascii(preview_og_image, font_scale_val, self.front_color, self.back_color)
+				width_fx = (self.root.winfo_screenwidth() * 0.8) / width
+				height_fx = (self.root.winfo_screenheight() * 0.8) / height
+				shrink_f = min(width_fx, height_fx)
+				if shrink_f < 1:
+					preview_img = cv2.resize(preview_img, (0, 0), fx=shrink_f, fy=shrink_f, interpolation=cv2.INTER_AREA)
 
-		preview_window = Toplevel(root)
-		preview_window.title("Preview")
-		preview_window.geometry(f"{width}x{height}+{(root.winfo_screenwidth() // 2) - (width // 2)}+{(root.winfo_screenheight() // 2) - (height // 2)}")
-		preview_image_object = PIL_Image.fromarray(preview_img)
-		preview_image_object = PIL_ImageTk.PhotoImage(image=preview_image_object)
-		preview_widget = Label(preview_window, image=preview_image_object)
-		preview_widget.place(x=0, y=0, width=width, height=height)
-		preview_window.iconbitmap(resource_path("data/convert-icon.ico"))
-		preview_window.grab_set()
-		preview_window.resizable(False, False)
-		preview_window.focus_force()
-		preview_window.wait_window()
-		status_line_lbl.config(text=f"Ready")
-		toggle_ui()
-	except (RuntimeError, _tkinter.TclError):
-		pass
+				height, width, _ = preview_img.shape
 
-def preview_video_converter(font_scale, color, open_path, v_stream_indx, width, height):
-	global ffmpeg_path, ascii_scale, started, preview_converting
+				self.status_line_lbl.config(text="Preview")
+				self.root.update_idletasks()
 
-	try:
-		out_img, err = (ffmpeg
-		               .input(open_path, ss=0)[v_stream_indx]
-		               .output('pipe:', vframes=1, format='image2', vcodec="mjpeg")
-		               .run(capture_stdout=True, cmd=ffmpeg_path)
-		               )
+				preview_window = tk.Toplevel(self.root)
+				preview_window.title("Preview")
+				preview_window.geometry(f"{width}x{height}"
+				                        f"+{(self.root.winfo_screenwidth() // 2) - (width // 2)}"
+				                        f"+{(self.root.winfo_screenheight() // 2) - (height // 2)}")
+				preview_image_object = PIL_Image.fromarray(preview_img)
+				preview_image_object = PIL_ImageTk.PhotoImage(image=preview_image_object)
+				preview_widget = tk.Label(preview_window, image=preview_image_object)
+				preview_widget.place(x=0, y=0, width=width, height=height)
+				preview_window.iconbitmap(self.resource_path("resources/convert-icon.ico"))
+				preview_window.grab_set()
+				preview_window.resizable(False, False)
+				preview_window.focus_force()
+				preview_window.wait_window()
 
-		preview_og_image = cv2.imdecode(np.asarray(bytearray(out_img), dtype="uint8"), cv2.IMREAD_COLOR)
+				self.status_line_lbl.config(text="Ready")
+			except Exception:
+				self.status_line_lbl.config(text="Error")
+			finally:
+				self.processing = False
+				self.update_ui()
+		except Exception:  # app was closed while processing
+			pass
 
-		preview_img = frame_to_ascii(preview_og_image, width, height, color, font_scale, ascii_scale)
-		width_fx = (root.winfo_screenwidth() * 0.8) / width
-		height_fx = (root.winfo_screenheight() * 0.8) / height
-		shrink_f = min(width_fx, height_fx)
-		if shrink_f < 1:
-			preview_img = cv2.resize(preview_img, (0, 0), fx=shrink_f, fy=shrink_f, interpolation=cv2.INTER_AREA)
-		preview_img = cv2.cvtColor(preview_img, cv2.COLOR_BGR2RGB)
+	@staticmethod
+	def resource_path(relative_path=""):
+		""" Get absolute path to resource, works for dev and for PyInstaller """
+		try:
+			# PyInstaller creates a temp folder and stores path in _MEIPASS
+			base_path = sys._MEIPASS
+		except Exception:
+			base_path = os.path.abspath(".")
+		return os.path.join(base_path, relative_path)
 
-		height, width, depth = preview_img.shape
-
-		started = False
-		preview_converting = False
-
-		status_line_lbl.config(text=f"Preview")
-		root.update_idletasks()
-
-		preview_window = Toplevel(root)
-		preview_window.title("Preview")
-		preview_window.geometry(f"{width}x{height}+{(root.winfo_screenwidth() // 2) - (width // 2)}+{(root.winfo_screenheight() // 2) - (height // 2)}")
-		preview_image_object = PIL_Image.fromarray(preview_img)
-		preview_image_object = PIL_ImageTk.PhotoImage(image=preview_image_object)
-		preview_widget = Label(preview_window, image=preview_image_object)
-		preview_widget.place(x=0, y=0, width=width, height=height)
-		preview_window.iconbitmap(resource_path("data/convert-icon.ico"))
-		preview_window.grab_set()
-		preview_window.resizable(False, False)
-		preview_window.focus_force()
-		preview_window.wait_window()
-		status_line_lbl.config(text=f"Ready")
-		toggle_ui()
-	except (RuntimeError, _tkinter.TclError):
-		pass
-
-def toggle_ui():
-	global started, selected_text_color
-
-	if started:
-		file_ent.config(state=DISABLED, highlightcolor="black", highlightbackground="black")
-		browse_btn.config(highlightcolor="black", highlightbackground="black")
-		background_black.config(highlightcolor="grey25", highlightbackground="grey25")
-		background_white.config(highlightcolor="grey25", highlightbackground="grey25")
-		fontscale_ent.config(state=DISABLED, highlightcolor="black", highlightbackground="black")
-		preview_btn.config(highlightcolor="black", highlightbackground="black")
-		convert_btn.config(text="Stop", highlightcolor="red", highlightbackground="red")
-	else:
-		file_ent.config(state=NORMAL, highlightcolor="green", highlightbackground="green")
-		browse_btn.config(highlightcolor="green", highlightbackground="green")
-		fontscale_ent.config(state=NORMAL, highlightcolor="green", highlightbackground="green")
-		preview_btn.config(highlightcolor="green", highlightbackground="green")
-		convert_btn.config(text="Convert", highlightcolor="green", highlightbackground="green")
-
-		if selected_text_color:
-			background_black.config(highlightcolor="green", highlightbackground="green")
-			background_white.config(highlightcolor="red", highlightbackground="red")
+	@staticmethod
+	def validate_fontscale(full_text):
+		if " " in full_text or "-" in full_text or full_text.count(".") > 1 or len(full_text) > 5:
+			return False
+		elif full_text == "" or full_text == ".":
+			return True
 		else:
-			background_black.config(highlightcolor="red", highlightbackground="red")
-			background_white.config(highlightcolor="green", highlightbackground="green")
-
-def main():
-	global started
-	global ascii_scale
-	global ffmpeg_path, ffprobe_path
-	global selected_text_color, started_no
-
-	global image_converting, video_converting
-	global image_convert_thread, video_convert_thread
-	global preview_converting, preview_convert_thread, preview_video_convert_thread
-
-	global root
-	global convert_btn, preview_btn, browse_btn
-	global file_ent, fontscale_ent
-	global status_line_lbl
-	global background_white, background_black
-
-	ascii_scale = r"""$@B%8&WM#*oahkbdpqwmZO0QLCJUYXzcvunxrjft/\|()1{}[]?-_+~<>i!lI;:,"^`'. """
-	ffmpeg_path = resource_path("run-data/ffmpeg/bin/ffmpeg.exe")
-	ffprobe_path = resource_path("run-data/ffmpeg/bin/ffprobe.exe")
-
-	selected_text_color = 0
-	started_no = 1
-	started = False
-	video_converting = False
-	image_converting = False
-	preview_converting = False
-	video_convert_thread = None
-	image_convert_thread = None
-	preview_convert_thread = None
-	preview_video_convert_thread = None
-
-	root = Tk()
-	root.title("Convert-2-ASCII")
-	root.resizable(False, False)
-	root.iconbitmap(resource_path("data/convert-icon.ico"))
-	root.config(background="#202A44")
-	root.geometry(f"500x250+{root.winfo_screenwidth() // 2 - 250}+{root.winfo_screenheight() // 2 - 125}")
-
-	reg = root.register(validate_input)
-	reg_ready = root.register(change_to_ready)
-
-	title = Label(root, text="Convert-2-ASCII", font=("Helvetica", 30, "bold", "italic"), borderwidth=0, background="#202A44", activebackground="#202A44", foreground="#ffffff", activeforeground="#ffffff")
-	title.place(x=0, y=0, width=500, height=100)
-
-	file_lbl = Label(root, text="File:", font=("Helvetica", 12, "bold"), borderwidth=0, background="#202A44", activebackground="#202A44", foreground="#ffffff", activeforeground="#ffffff")
-	file_lbl.place(x=0, y=150, width=50, height=30)
-	file_ent = Entry(root, font=("Helvetica", 10), validate="key", validatecommand=(reg_ready, "%P"), borderwidth=0, highlightthickness=1, highlightbackground="green", highlightcolor="green", disabledbackground="grey15", disabledforeground="#ffffff", background="grey15", foreground="#ffffff", justify=LEFT, insertbackground="#ffffff")
-	file_ent.place(x=46, y=150, width=390, height=30)
-	browse_btn = Label(root, text="Browse", font=("Helvetica", 10), highlightthickness=1, highlightbackground="green", highlightcolor="green", borderwidth=0, background="grey15", activebackground="grey15", foreground="#ffffff", activeforeground="#ffffff")
-	browse_btn.place(x=435, y=150, width=65, height=30)
-	browse_btn.bind("<Enter>", lambda event: change_thickness(event, browse_btn, False))
-	browse_btn.bind("<Leave>", lambda event: change_thickness(event, browse_btn, True))
-	browse_btn.bind("<ButtonRelease-1>", browse_click)
-
-	background_lbl = Label(root, text="Background:", font=("Helvetica", 12, "bold"), borderwidth=0, background="#202A44", activebackground="#202A44", foreground="#ffffff", activeforeground="#ffffff")
-	background_lbl.place(x=270, y=105, width=100, height=30)
-	background_white = Label(root, highlightthickness=4, highlightbackground="green", highlightcolor="green", borderwidth=0, background="#ffffff", activebackground="#ffffff")
-	background_white.place(x=375, y=105, width=30, height=30)
-	background_white.bind("<Enter>", lambda event: change_color_select_thickness(event, background_white, 255, False))
-	background_white.bind("<Leave>", lambda event: change_color_select_thickness(event, background_white, 255, True))
-	background_white.bind("<ButtonRelease-1>", lambda event: color_select_click(event, 255))
-	background_black = Label(root, highlightthickness=7, highlightbackground="red", highlightcolor="red", borderwidth=0, background="#000000", activebackground="#000000")
-	background_black.place(x=405, y=105, width=30, height=30)
-	background_black.bind("<Enter>", lambda event: change_color_select_thickness(event, background_black, 0, False))
-	background_black.bind("<Leave>", lambda event: change_color_select_thickness(event, background_black, 0, True))
-	background_black.bind("<ButtonRelease-1>", lambda event: color_select_click(event, 0))
-
-	fontscale_lbl = Label(root, text="Font scale:", font=("Helvetica", 12, "bold"), borderwidth=0, background="#202A44", activebackground="#202A44", foreground="#ffffff", activeforeground="#ffffff")
-	fontscale_lbl.place(x=50, y=105, width=85, height=30)
-	fontscale_ent = Entry(root, font=("Helvetica", 10), validate="key", validatecommand=(reg, "%P"), justify=CENTER, borderwidth=0, highlightthickness=1, highlightbackground="green", highlightcolor="green", disabledbackground="grey15", disabledforeground="#ffffff", background="grey15", foreground="#ffffff", insertbackground="#ffffff")
-	fontscale_ent.place(x=140, y=105, width=50, height=30)
-	fontscale_ent.insert(0, "0.5")
-
-	convert_btn = Label(root, text="Convert", font=("Helvetica", 10), highlightthickness=1, highlightbackground="green", highlightcolor="green", borderwidth=0, background="grey15", activebackground="grey15", foreground="#ffffff", activeforeground="#ffffff")
-	convert_btn.place(x=370, y=203, width=100, height=30)
-	convert_btn.bind("<Enter>", lambda event: convert_change_thickness(event, False))
-	convert_btn.bind("<Leave>", lambda event: convert_change_thickness(event, True))
-	convert_btn.bind("<ButtonRelease-1>", lambda event: convert_click(event, file_ent.get()))
-
-	preview_btn = Label(root, text="Preview", font=("Helvetica", 10), highlightthickness=1, highlightbackground="green", highlightcolor="green", borderwidth=0, background="grey15", activebackground="grey15", foreground="#ffffff", activeforeground="#ffffff")
-	preview_btn.place(x=30, y=203, width=100, height=30)
-	preview_btn.bind("<Enter>", lambda event: change_thickness(event, preview_btn, False))
-	preview_btn.bind("<Leave>", lambda event: change_thickness(event, preview_btn, True))
-	preview_btn.bind("<ButtonRelease-1>", lambda event: preview_click(event, file_ent.get()))
-
-	status_line_lbl = Label(root, text="Ready", font=("Helvetica", 9, "bold"), borderwidth=0, background="#202A44", activebackground="#202A44", foreground="#ffffff", activeforeground="#ffffff")
-	status_line_lbl.place(x=130, y=203, width=240, height=30)
-
-	root.mainloop()
-
-	try:
-		root.destroy()
-	except _tkinter.TclError:
-		pass
-	started = False
-	try:
-		video_convert_thread.join()
-	except AttributeError:
-		pass
-	try:
-		image_convert_thread.join()
-	except AttributeError:
-		pass
-	try:
-		preview_convert_thread.join()
-	except AttributeError:
-		pass
-	try:
-		preview_video_convert_thread.join()
-	except AttributeError:
-		pass
+			try:
+				float(full_text)
+				return True
+			except ValueError:
+				return False
 
 
 if __name__ == "__main__":
-	freeze_support()
-
-	main()
+	multiprocessing.freeze_support()
+	App()
